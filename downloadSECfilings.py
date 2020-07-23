@@ -1,11 +1,11 @@
 # Copyright 2014 Altova GmbH
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -22,6 +22,23 @@ from urllib.error import URLError, HTTPError
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
+import random
+
+
+edgarNamespaces = [{'edgar': 'http://www.sec.gov/Archives/edgar'}, {'edgar': 'https://www.sec.gov/Archives/edgar'}]
+cik_list = {}
+
+
+def read_ticket_txt():
+	f = open('ticker.txt', 'r')
+	file = f.read()
+	x = file.split("\n")
+	for y in x:
+		w = y.split("\t")
+		if cik_list.get(w[1]):
+			continue
+		cik_list[w[1]] = w[0]
+
 
 def downloadfile( sourceurl, targetfname ):
 	mem_file = ""
@@ -53,37 +70,35 @@ def downloadfile( sourceurl, targetfname ):
 			output.close()
 		return good_read
 
+
+def getTargetDirectory(cik_number):
+	cik_number = cik_number.lstrip('0')
+	ticker = cik_list.get(cik_number, cik_number).upper()
+
+	if not os.path.exists( "sec/" + ticker):
+		os.makedirs( "sec/" + ticker)
+	target_dir = "sec/" + ticker + '/'
+	return target_dir
+
+
 def SECdownload(year, month):
 	root = None
 	feedFile = None
 	feedData = None
 	good_read = False
 	itemIndex = 0
-	edgarFilingsFeed = 'http://www.sec.gov/Archives/edgar/monthly/xbrlrss-' + str(year) + '-' + str(month).zfill(2) + '.xml'
+
+	feed_filename = 'xbrlrss-' + str(year) + '-' + str(month).zfill(2) + '.xml'
+	feed_directory = 'sec/rss/'
+	edgarFilingsFeed = 'http://www.sec.gov/Archives/edgar/monthly/{}'.format(feed_filename)
 	print( edgarFilingsFeed )
-	if not os.path.exists( "sec/" + str(year) ):
-		os.makedirs( "sec/" + str(year) )
-	if not os.path.exists( "sec/" + str(year) + '/' + str(month).zfill(2) ):
-		os.makedirs( "sec/" + str(year) + '/' + str(month).zfill(2) )
-	target_dir = "sec/" + str(year) + '/' + str(month).zfill(2) + '/'
-	try:
-		feedFile = urlopen( edgarFilingsFeed )
-		try:
-			feedData = feedFile.read()
-			good_read = True
-		finally:
-			feedFile.close()
-	except HTTPError as e:
-		print( "HTTP Error:", e.code )
-	except URLError as e:
-		print( "URL Error:", e.reason )
-	except TimeoutError as e:
-		print( "Timeout Error:", e.reason )
-	except socket.timeout:
-		print( "Socket Timeout Error" )
-	if not good_read:
-		print( "Unable to download RSS feed document for the month:", year, month )
-		return
+
+	target_feed_filename = feed_directory + feed_filename
+	if not downloadfile(edgarFilingsFeed, target_feed_filename):
+		raise Exception("Could not download " + edgarFilingsFeed)
+
+	feedData = open(target_feed_filename, 'r').read()
+
 	# we have to unfortunately use both feedparser (for normal cases) and ET for old-style RSS feeds,
 	# because feedparser cannot handle the case where multiple xbrlFiles are referenced without enclosure
 	try:
@@ -95,6 +110,7 @@ def SECdownload(year, month):
 		print( feed[ "channel" ][ "title" ] )
 	except KeyError as e:
 		print( "Key Error:", e )
+
 	# Process RSS feed and walk through all items contained
 	for item in feed.entries:
 		print( item[ "summary" ], item[ "title" ], item[ "published" ] )
@@ -106,7 +122,11 @@ def SECdownload(year, month):
 				enclosure = enclosures[0]
 				sourceurl = enclosure[ "href" ]
 				cik = item[ "edgar_ciknumber" ]
-				targetfname = target_dir+cik+'-'+sourceurl.split('/')[-1]
+
+				target_dir = getTargetDirectory(str(cik))
+				targetfname = target_dir + str(year) + "-" + str(month).zfill(2) + "-" + sourceurl.split('/')[-1]
+				print(targetfname)
+
 				retry_counter = 3
 				while retry_counter > 0:
 					good_read = downloadfile( sourceurl, targetfname )
@@ -120,47 +140,82 @@ def SECdownload(year, month):
 				linkname = item[ "link" ].split('/')[-1]
 				linkbase = os.path.splitext(linkname)[0]
 				cik = item[ "edgar_ciknumber" ]
+
+				target_dir = getTargetDirectory(str(cik))
+
 				zipfname = target_dir+cik+'-'+linkbase+"-xbrl.zip"
+				print(zipfname)
 				if os.path.isfile( zipfname ):
 					print( "Local copy already exists" )
-				else:
-					edgarNamespace = {'edgar': 'http://www.sec.gov/Archives/edgar'}
-					currentItem = list(root.iter( "item" ))[itemIndex]
+					continue
+
+				currentItem = list(root.iter( "item" ))[itemIndex]
+				xbrlFiling = None
+				xbrlFilesItem = None
+				xbrlFiles = None
+
+				for edgarNamespace in edgarNamespaces:
 					xbrlFiling = currentItem.find( "edgar:xbrlFiling", edgarNamespace )
+					if not xbrlFiling:
+						continue
+
 					xbrlFilesItem = xbrlFiling.find( "edgar:xbrlFiles", edgarNamespace )
 					xbrlFiles = xbrlFilesItem.findall( "edgar:xbrlFile", edgarNamespace )
-					if not os.path.exists(  target_dir+"temp" ):
-						os.makedirs( target_dir+"temp" )
-					zf = zipfile.ZipFile( zipfname, "w" )
-					try:
-						for xf in xbrlFiles:
-							xfurl = xf.get( "{http://www.sec.gov/Archives/edgar}url" )
-							if xfurl.endswith( (".xml",".xsd") ):
-								targetfname = target_dir+"temp/"+xfurl.split('/')[-1]
-								retry_counter = 3
-								while retry_counter > 0:
-									good_read = downloadfile( xfurl, targetfname )
-									if good_read:
-										break
-									else:
-										print( "Retrying:", retry_counter )
-										retry_counter -= 1
-								zf.write( targetfname, xfurl.split('/')[-1], zipfile.ZIP_DEFLATED )
-								os.remove( targetfname )
-					finally:
-						zf.close()
-						os.rmdir( target_dir+"temp" )
+					break
+
+				if not xbrlFiling:
+					raise Exception("can't find xbrlFiling")
+
+				temp_zip_dir = target_dir + "temp" + str(random.randint(1,1000000)) + "/"
+				if not os.path.exists(temp_zip_dir):
+					os.makedirs(temp_zip_dir)
+
+				zf = zipfile.ZipFile( zipfname, "w" )
+
+				try:
+					for xf in xbrlFiles:
+						xfurl = xf.get( "{http://www.sec.gov/Archives/edgar}url" )
+						if xfurl.endswith( (".xml",".xsd") ):
+							targetfname = temp_zip_dir + xfurl.split('/')[-1]
+							print(targetfname)
+							retry_counter = 3
+							while retry_counter > 0:
+								good_read = downloadfile( xfurl, targetfname )
+								if good_read:
+									break
+								else:
+									print( "Retrying:", retry_counter )
+									retry_counter -= 1
+							if not os.path.isfile(targetfname):
+								continue
+
+							zf.write( targetfname, xfurl.split('/')[-1], zipfile.ZIP_DEFLATED )
+							os.remove( targetfname )
+				finally:
+					zf.close()
+					os.rmdir(temp_zip_dir)
 		except KeyError as e:
 			print( "Key Error:", e )
+		except:
+			print( "ERROR", itemIndex, item[ "summary" ], item[ "title" ], item[ "published" ], item["links"] )
+			raise
 		finally:
 			print( "----------" )
 		itemIndex += 1
 
 def main(argv):
+
+	read_ticket_txt()
+
+	if not os.path.exists("sec/"):
+		os.makedirs( "sec/")
+	if not os.path.exists("sec/rss"):
+		os.makedirs( "sec/rss")
+
 	year = 2013
 	month = 1
 	from_year = 1999
-	to_year = 1999
+	to_year = 2020
 	year_range = False
 	if not os.path.exists( "sec" ):
 		os.makedirs( "sec" )
